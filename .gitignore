@@ -1,0 +1,33 @@
+# IDE and system
+.vscode
+.cache
+.DS_Store
+
+# Build and install
+build
+log
+install
+build_image
+build_ros2
+dist
+
+# Local configs
+brain_local.yaml
+vision_local.yaml
+
+# Log files
+*.log
+
+# Large model files
+src/vision/model/
+*.onnx
+*.engine
+
+# Third-party archives
+third_party/*.tgz
+third_party_aarch64/*.tgz
+*.tgz
+*.tar.gz
+*.zip
+*.7z
+*.tar
