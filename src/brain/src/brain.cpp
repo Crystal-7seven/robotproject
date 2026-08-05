@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <fstream> 
+#include <cmath>
 #include <yaml-cpp/yaml.h>
 
 #include "brain.h"
@@ -88,7 +89,18 @@ Brain::Brain() : rclcpp::Node("brain_node")
     declare_parameter<double>("strategy.shoot.ymin", -0.5);
     declare_parameter<double>("strategy.shoot.ymax", 0.5);
     declare_parameter<bool>("strategy.cooperation.enable_role_switch", true);
-    declare_parameter<double>("strategy.cooperation.ball_control_cost_threshold", 10.0);
+    declare_parameter<double>("strategy.cooperation.ball_control_cost_threshold", 20.0);
+    declare_parameter<double>("strategy.cooperation.ball_control_cost_tie_epsilon", 0.35);
+    declare_parameter<bool>("strategy.cooperation.touch_cost.enabled", true);
+    declare_parameter<double>("strategy.cooperation.touch_cost.w_arrival_time", 1.0);
+    declare_parameter<double>("strategy.cooperation.touch_cost.w_ball_age", 0.5);
+    declare_parameter<double>("strategy.cooperation.touch_cost.w_heading", 0.3);
+    declare_parameter<double>("strategy.cooperation.touch_cost.w_adjust", 1.0);
+    declare_parameter<double>("strategy.cooperation.touch_cost.w_obstacle", 2.0);
+    declare_parameter<double>("strategy.cooperation.touch_cost.w_teammate", 3.0);
+    declare_parameter<double>("strategy.cooperation.touch_cost.ema_alpha", 0.35);
+    declare_parameter<double>("strategy.cooperation.touch_cost.switch_margin_secs", 0.75);
+    declare_parameter<double>("strategy.cooperation.teammate_collision_width", 0.85);
 
     declare_parameter<int>("obstacle_avoidance.depth_sample_step", 16);
     declare_parameter<double>("obstacle_avoidance.obstacle_min_height", 0.15);
@@ -404,19 +416,16 @@ void Brain::handleCooperation() {
     string selfRole = config->get_player_role();
 
     vector<int> aliveTmIdxs = {}; // Indices of all alive teammates, excluding self
-
-    // Update own status
-    data->tmImAlive = 
-        (data->penalty[selfIdx] == PENALTY_NONE) // Am I online, i.e., not penalized
-        && tree->getEntry<bool>("odom_calibrated"); // Before localization is successful, consider own information unreliable, not alive
-    updateCostToKick(); // Current cost to kick
-    log_(format("ImAlive: %d, myCost: %.1f", data->tmImAlive, data->tmMyCost));
-
-    
-    // Determine the number of alive teammates on the field based on referee data and log it
     const int playerCount = min(max(numOfPlayers, 1), MAX_NUM_PLAYERS);
     const int gcAliveCount = data->liveCount;
     log_(format("gcAliveCnt: %d", gcAliveCount));
+
+    // Clear slots outside the active game mode before cost or election logic
+    // can observe stale teammate state.
+    for (int i = playerCount; i < MAX_NUM_PLAYERS; i++) {
+        data->tmStatus[i].isAlive = false;
+        data->tmStatus[i].isLead = false;
+    }
 
     // Process teammate information. If no information is received from a teammate for a long time, or the teammate is in a penalty state according to the referee, the teammate is considered offline. Then get the indices of all online teammates.
     for (int i = 0; i < playerCount; i++) {
@@ -449,6 +458,16 @@ void Brain::handleCooperation() {
             log->log_scalar("tm_status",format("tm_lead_scalar_%d", i + 1), data->tmStatus[i].isLead ? 1 : 0);
         }
     }
+
+    // Refresh own status after teammate validity has been cleaned. A fallen
+    // robot must not remain eligible to become the leader.
+    data->tmImAlive =
+        (data->penalty[selfIdx] == PENALTY_NONE)
+        && tree->getEntry<bool>("odom_calibrated")
+        && data->recoveryState != RobotRecoveryState::HAS_FALLEN;
+    updateCostToKick(); // Current cost to kick
+    log_(format("ImAlive: %d, myCost: %.1f", data->tmImAlive, data->tmMyCost));
+
     log_(format("alive TM Count: %d", aliveTmIdxs.size()));
 
     // Log information of currently alive teammates
@@ -535,34 +554,102 @@ void Brain::handleCooperation() {
         tree->setEntry<string>("player_role", selfRole);
     }
 
-    // New lead logic, no longer sending commands, but judging by itself 
-    double tmMinCost = 1e5;
-    int myCostRank = 0;
+    // Deterministic ball-control arbitration. The tie epsilon only resolves
+    // nearly equal costs; switching an already selected leader requires a
+    // real 0.75 s improvement by default.
+    constexpr double INVALID_COST = 1e8;
+    const double costTieEpsilon = max(config->get_ball_control_cost_tie_epsilon(), 0.01);
+    const double switchMargin = max(config->get_touch_cost_switch_margin_secs(), 0.0);
+    const bool selfHasBallInfo = data->ballDetected || tree->getEntry<bool>("ball_location_known");
+    auto hasValidCost = [INVALID_COST](double cost) {
+        return std::isfinite(cost) && cost < INVALID_COST;
+    };
+    auto isBetterCandidate = [costTieEpsilon](double cost, int playerId, double otherCost, int otherId) {
+        if (cost < otherCost - costTieEpsilon) return true;
+        return fabs(cost - otherCost) <= costTieEpsilon && playerId < otherId;
+    };
+
+    double tmMinCost = INVALID_COST;
+    int myCostRank = MAX_NUM_PLAYERS;
     int myStrikerIDRank = 0;
+    int bestPlayerId = -1;
+    double bestCost = INVALID_COST;
+    double previousLeaderCost = INVALID_COST;
+    bool previousLeaderValid = false;
+    const bool selfCandidate = data->tmImAlive && selfHasBallInfo && hasValidCost(data->tmMyCost);
+
+    if (selfCandidate) {
+        bestPlayerId = selfId;
+        bestCost = data->tmMyCost;
+        tmMinCost = data->tmMyCost;
+        if (selectedLeaderId_ == selfId) {
+            previousLeaderCost = data->tmMyCost;
+            previousLeaderValid = true;
+        }
+    }
+
     for (int i = 0; i < aliveTmIdxs.size(); i++) {
         int tmIdx = aliveTmIdxs[i];
         auto tmStatus = data->tmStatus[tmIdx];
-        if (tmStatus.cost < tmMinCost) tmMinCost = tmStatus.cost;
-        if (tmStatus.cost < data->tmMyCost) myCostRank++;
         if (tmIdx < selfIdx && tmStatus.role == "striker") myStrikerIDRank++;
+
+        // A teammate without valid ball information or a finite cost must not
+        // participate in the claim election.
+        const bool teammateHasBallInfo = tmStatus.poseValid
+            && (tmStatus.ballDetected || tmStatus.ballLocationKnown);
+        if (!teammateHasBallInfo || !hasValidCost(tmStatus.cost)) continue;
+
+        const int tmPlayerId = tmIdx + 1;
+        if (tmStatus.cost < tmMinCost) tmMinCost = tmStatus.cost;
+        if (tmPlayerId == selectedLeaderId_) {
+            previousLeaderCost = tmStatus.cost;
+            previousLeaderValid = true;
+        }
+        if (bestPlayerId < 0 || isBetterCandidate(tmStatus.cost, tmPlayerId, bestCost, bestPlayerId)) {
+            bestPlayerId = tmPlayerId;
+            bestCost = tmStatus.cost;
+        }
     }
+
+    if (selfCandidate) {
+        myCostRank = 0;
+        for (int i = 0; i < aliveTmIdxs.size(); i++) {
+            int tmIdx = aliveTmIdxs[i];
+            auto tmStatus = data->tmStatus[tmIdx];
+            if (!tmStatus.poseValid
+                || !(tmStatus.ballDetected || tmStatus.ballLocationKnown)
+                || !hasValidCost(tmStatus.cost)) continue;
+            if (isBetterCandidate(tmStatus.cost, tmIdx + 1, data->tmMyCost, selfId)) {
+                myCostRank++;
+            }
+        }
+    }
+
+    int selectedPlayerId = bestPlayerId;
+    if (previousLeaderValid && bestPlayerId >= 0 && bestPlayerId != selectedLeaderId_) {
+        const double improvement = previousLeaderCost - bestCost;
+        if (improvement < switchMargin) {
+            selectedPlayerId = selectedLeaderId_;
+        }
+    }
+    if (selectedPlayerId != selectedLeaderId_) {
+        log_(format("leader switch: %d -> %d, best improvement: %.2f s, margin: %.2f s",
+            selectedLeaderId_, selectedPlayerId,
+            previousLeaderValid && bestPlayerId >= 0 ? previousLeaderCost - bestCost : 0.0,
+            switchMargin));
+        selectedLeaderId_ = selectedPlayerId;
+    }
+
     data->tmMyCostRank = myCostRank;
     data->myStrikerIDRank = myStrikerIDRank;
-    if (
-        (tmMinCost <  config->get_ball_control_cost_threshold() && data->tmMyCost > tmMinCost)
-        || myCostRank >= 2
-    ) {
-        // A teammate is controlling the ball
-        data->tmImLead = false;
-        tree->setEntry<bool>("is_lead", false);
-        log_("I am not lead");
-
-    } else {
-        data->tmImLead = true;
-        tree->setEntry<bool>("is_lead", true);
-        log_("I am Lead");
+    data->tmImLead = selfCandidate && selectedPlayerId == selfId;
+    tree->setEntry<bool>("is_lead", data->tmImLead);
+    const double warningThreshold = config->get_ball_control_cost_threshold();
+    if (bestPlayerId >= 0 && std::isfinite(warningThreshold) && bestCost > warningThreshold) {
+        log_(format("best touch cost warning: %.2f > %.2f", bestCost, warningThreshold));
     }
-    log_(format("tmMinCost: %.1f, myCost: %.1f, myCostRank: %d, myStrikerIDRank: %d", tmMinCost, data->tmMyCost, myCostRank, myStrikerIDRank));
+    log_(format("bestPlayer: %d, selectedLeader: %d, tmMinCost: %.1f, myCost: %.1f, myCostRank: %d, myStrikerIDRank: %d, lead: %d",
+        bestPlayerId, selectedPlayerId, tmMinCost, data->tmMyCost, myCostRank, myStrikerIDRank, data->tmImLead));
 
     // Publish command: Goalkeeper should attack, instruct to switch goalkeeper
     if (
@@ -869,82 +956,121 @@ void Brain::updateCostToKick() {
     auto log_ = [=](string msg) {
         log->debug("updateCostToKick", msg);
     };
-    double cost = 0.;
+    constexpr double INVALID_COST = 1e9;
+    auto invalidate = [&](const string &reason) {
+        data->tmMyCost = INVALID_COST;
+        data->tmMyCostInitialized = false;
+        log_(format("invalid touch cost: %s", reason.c_str()));
+    };
 
-    // ball not detected
-    double secsSinceBallDet = msecsSince(data->ball.timePoint) / 1000;
-    cost += secsSinceBallDet;
-    log_(format("ball not dectect cost: %.1f", secsSinceBallDet));
-
-    // Ball lost
-    if (!tree->getEntry<bool>("ball_location_known")) {
-        cost += 5.0;
-        log_(format("ball lost cost: %.1f", 5.0));
+    if (!config->get_touch_cost_enabled()) {
+        invalidate("disabled");
+        return;
     }
 
-    // cost of chasing the ball
-    cost += data->ball.range;
-    log_(format("ball range cost: %.1f", data->ball.range));
-    
-    
-    // cost of obstacles on the way to the ball
-    if (distToObstacle(data->ball.yawToRobot) < 1.5) {
-        log_(format("obstacle cost: %.1f", 2.0));
-        cost += 0.5;
+    const bool ballKnown = data->ballDetected || tree->getEntry<bool>("ball_location_known");
+    const double ballAge = max(0.0, msecsSince(data->ball.timePoint) / 1000.0);
+    const double maxBallAge = max(config->get_ball_memory_timeout(), 0.1);
+
+    if (!ballKnown || ballAge > maxBallAge) {
+        invalidate(!ballKnown ? "ball_unknown" : "ball_stale");
+        return;
+    }
+    if (!tree->getEntry<bool>("odom_calibrated")) {
+        invalidate("localization_invalid");
+        return;
+    }
+    if (data->recoveryState == RobotRecoveryState::HAS_FALLEN) {
+        invalidate("fallen");
+        return;
     }
 
-    // cost of turning towards the ball
-    cost += fabs(data->ball.yawToRobot) / 1.0; 
-    log_(format("ball yaw cost: %.1f", fabs(data->ball.yawToRobot) / 1.0));
+    const double ballRange = data->ball.range;
+    const double ballYaw = data->ball.yawToRobot;
+    const double kickDir = data->kickDir;
+    const double robotBallAngle = data->robotBallAngleToField;
+    if (!std::isfinite(ballRange) || ballRange < 0.0
+        || !std::isfinite(ballYaw) || !std::isfinite(kickDir)
+        || !std::isfinite(robotBallAngle)) {
+        invalidate("non_finite_ball_state");
+        return;
+    }
 
+    const double configuredSpeed = config->get_vx_limit() * config->get_vx_factor();
+    const double effectiveSpeed = std::isfinite(configuredSpeed)
+        ? max(configuredSpeed, 0.1)
+        : 0.1;
+    const double angularSpeed = max(config->get_vtheta_limit(), 0.1);
 
-    // cost of bumping into teammates
-    int selfIdx = config->get_player_id() - 1;
-    for (int i = 0; i < MAX_NUM_PLAYERS; i++) {
-        if (i == selfIdx) continue; // Skip self
+    const double moveTime = ballRange / effectiveSpeed;
+    const double headingTime = fabs(ballYaw) / angularSpeed;
+    const double adjustTime = fabs(toPInPI(kickDir - robotBallAngle)) * 0.4 / 0.3;
 
-        auto status = data->tmStatus[i]; // Teammate status
-        if (!status.isAlive) continue; // Skip offline teammates
+    const double safeDistance = max(config->get_safe_distance(), 0.1);
+    const double staticObstacleDistance = distToObstacle(ballYaw, false);
+    const double obstacleRisk = min(1.0, max(0.0,
+        (safeDistance - staticObstacleDistance) / safeDistance));
 
-        double theta_tm2ball = atan2(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
-        double range_tm2ball = norm(status.ballPosToField.y - status.robotPoseToField.y, status.ballPosToField.x - status.robotPoseToField.x);
-        double theta_me2ball = data->robotBallAngleToField;
-        double range_me2ball = data->ball.range;
-        double deltaTheta = fabs(toPInPI(theta_tm2ball - theta_me2ball));
+    const int selfIdx = config->get_player_id() - 1;
+    const int playerCount = min(max(config->get_num_of_players(), 1), MAX_NUM_PLAYERS);
+    const int COM_TIMEOUT = 5000;
+    const double teammateWidth = max(config->get_teammate_collision_width(), 0.1);
+    double teammateRisk = 0.0;
+    for (int i = 0; i < playerCount; i++) {
+        if (i == selfIdx) continue;
 
-        const double BUMP_DIST = 1.0;
-        if (range_tm2ball < range_me2ball && sin(deltaTheta) * range_tm2ball < BUMP_DIST) {
-            cost += 2.0;
-            log_(format("bump cost: %.1f", 2.0));  
+        const auto &status = data->tmStatus[i];
+        if (!status.isAlive || msecsSince(status.timeLastCom) > COM_TIMEOUT) continue;
+        if (!status.poseValid || !(status.ballDetected || status.ballLocationKnown)) continue;
+
+        const double tmDx = status.ballPosToField.x - status.robotPoseToField.x;
+        const double tmDy = status.ballPosToField.y - status.robotPoseToField.y;
+        const double tmRange = norm(tmDy, tmDx);
+        if (!std::isfinite(tmRange) || tmRange >= ballRange) continue;
+
+        const double tmTheta = atan2(tmDy, tmDx);
+        const double deltaTheta = fabs(toPInPI(tmTheta - robotBallAngle));
+        const double lateralDistance = fabs(sin(deltaTheta)) * tmRange;
+        if (lateralDistance < teammateWidth) {
+            const double localRisk = 1.0 - lateralDistance / teammateWidth;
+            teammateRisk = min(1.0, teammateRisk + max(0.0, localRisk));
         }
     }
 
-    // cost of adjusting
-    cost += fabs(toPInPI(data->kickDir - data->robotBallAngleToField)) * 0.4 / 0.3; // 0.4 is the approximate distance to turn around the ball, 0.3 is the approximate tangential speed to turn around the ball
-    log_(format("adjust cost: %.1f", fabs(toPInPI(data->kickDir - data->robotBallAngleToField)) * 0.4 / 0.3));
-    
+    auto nonNegative = [](double value) {
+        return std::isfinite(value) ? max(value, 0.0) : 0.0;
+    };
+    const double rawCost =
+        nonNegative(config->get_touch_cost_w_arrival_time()) * moveTime
+        + nonNegative(config->get_touch_cost_w_ball_age()) * ballAge
+        + nonNegative(config->get_touch_cost_w_heading()) * headingTime
+        + nonNegative(config->get_touch_cost_w_adjust()) * adjustTime
+        + nonNegative(config->get_touch_cost_w_obstacle()) * obstacleRisk
+        + nonNegative(config->get_touch_cost_w_teammate()) * teammateRisk;
 
-    // cost increase after falling
-    if (data->recoveryState == RobotRecoveryState::HAS_FALLEN) {
-        cost += 15.0;
-        log_(format("fall cost: %.1f", 15.0));  
+    if (!std::isfinite(rawCost)) {
+        invalidate("non_finite_cost");
+        return;
     }
 
-    
-    // cost increase if localization fails
-    if (!tree->getEntry<bool>("odom_calibrated")) {
-        cost += 100;
-        log_(format("localization cost: %.1f", 100.0));  
+    const double alpha = min(1.0, max(0.05, config->get_touch_cost_ema_alpha()));
+    const double lastCost = data->tmMyCost;
+    const double smoothCost = data->tmMyCostInitialized
+        ? lastCost * (1.0 - alpha) + rawCost * alpha
+        : rawCost;
+    data->tmMyCost = smoothCost;
+    data->tmMyCostInitialized = true;
 
+    log_(format("move_time: %.2f, ball_age: %.2f, heading_time: %.2f, adjust_time: %.2f",
+        moveTime, ballAge, headingTime, adjustTime));
+    log_(format("obstacle_risk: %.2f, teammate_risk: %.2f, raw_cost: %.2f",
+        obstacleRisk, teammateRisk, rawCost));
+    log_(format("last_cost: %.2f, smooth_cost: %.2f", lastCost, smoothCost));
+
+    const double warningThreshold = config->get_ball_control_cost_threshold();
+    if (std::isfinite(warningThreshold) && smoothCost > warningThreshold) {
+        log_(format("touch cost warning: %.2f > %.2f", smoothCost, warningThreshold));
     }
-    
-
-    // smoothing
-    double lastCost = data->tmMyCost;
-    data->tmMyCost = lastCost * 0.8 + cost * 0.2;
-    log_(format("lastCost: %.1f, newCost: %.1f, smoothCost: %.1f", lastCost, cost, data->tmMyCost));
-
-    return;
 }
 
 bool Brain::isAngleGood(double goalPostMargin, string type) {
@@ -2316,7 +2442,7 @@ void Brain::processDepthImage(const cv::Mat &depthFloat, int width, int height, 
     }
 }
 
-double Brain::distToObstacle(double angle) {
+double Brain::distToObstacle(double angle, bool includeTeammates) {
     auto obs = data->getObstacles();
     double minDist = 1e9;
     double obstacleThreshold = config->get_occupancy_threshold();
@@ -2336,6 +2462,31 @@ double Brain::distToObstacle(double angle) {
             if (dist > 0 && dist < minDist) {
                 minDist = dist;
             }
+        }
+    }
+
+    if (!includeTeammates) return minDist;
+
+    // Treat communicating teammates as dynamic obstacles as well. The depth
+    // grid cannot reliably see a teammate outside the current camera view,
+    // while the team packet already contains its field pose.
+    const double selfTheta = data->robotPoseToField.theta;
+    const double teammateWidth = max(config->get_teammate_collision_width(), collisionThreshold);
+    const int playerCount = min(max(config->get_num_of_players(), 1), MAX_NUM_PLAYERS);
+    for (int i = 0; i < playerCount; i++) {
+        if (i == config->get_player_id() - 1) continue;
+        const auto &tm = data->tmStatus[i];
+        if (!tm.isAlive || !tm.poseValid || msecsSince(tm.timeLastCom) > 5000) continue;
+
+        const double dxField = tm.robotPoseToField.x - data->robotPoseToField.x;
+        const double dyField = tm.robotPoseToField.y - data->robotPoseToField.y;
+        const double xRobot = cos(selfTheta) * dxField + sin(selfTheta) * dyField;
+        const double yRobot = -sin(selfTheta) * dxField + cos(selfTheta) * dyField;
+        const double projection = xRobot * cos(angle) + yRobot * sin(angle);
+        const double lateral = fabs(-sin(angle) * xRobot + cos(angle) * yRobot);
+
+        if (projection > 0.0 && lateral < teammateWidth && projection < minDist) {
+            minDist = projection;
         }
     }
     return minDist;

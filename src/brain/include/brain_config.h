@@ -61,6 +61,17 @@ public:
     bool get_abort_kick_when_ball_moved();
     bool get_enable_role_switch();
     double get_ball_control_cost_threshold();
+    double get_ball_control_cost_tie_epsilon();
+    bool get_touch_cost_enabled();
+    double get_touch_cost_w_arrival_time();
+    double get_touch_cost_w_ball_age();
+    double get_touch_cost_w_heading();
+    double get_touch_cost_w_adjust();
+    double get_touch_cost_w_obstacle();
+    double get_touch_cost_w_teammate();
+    double get_touch_cost_ema_alpha();
+    double get_touch_cost_switch_margin_secs();
+    double get_teammate_collision_width();
 
     bool get_enable_auto_visual_kick();
     double get_auto_visual_kick_enable_dist_min();

@@ -150,7 +150,51 @@ bool BrainConfig::get_enable_role_switch() {
 }
 
 double BrainConfig::get_ball_control_cost_threshold() {
-    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.ball_control_cost_threshold", 2.0);
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.ball_control_cost_threshold", 20.0);
+}
+
+double BrainConfig::get_ball_control_cost_tie_epsilon() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.ball_control_cost_tie_epsilon", 0.35);
+}
+
+bool BrainConfig::get_touch_cost_enabled() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.enabled", true);
+}
+
+double BrainConfig::get_touch_cost_w_arrival_time() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.w_arrival_time", 1.0);
+}
+
+double BrainConfig::get_touch_cost_w_ball_age() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.w_ball_age", 0.5);
+}
+
+double BrainConfig::get_touch_cost_w_heading() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.w_heading", 0.3);
+}
+
+double BrainConfig::get_touch_cost_w_adjust() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.w_adjust", 1.0);
+}
+
+double BrainConfig::get_touch_cost_w_obstacle() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.w_obstacle", 2.0);
+}
+
+double BrainConfig::get_touch_cost_w_teammate() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.w_teammate", 3.0);
+}
+
+double BrainConfig::get_touch_cost_ema_alpha() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.ema_alpha", 0.35);
+}
+
+double BrainConfig::get_touch_cost_switch_margin_secs() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.touch_cost.switch_margin_secs", 0.75);
+}
+
+double BrainConfig::get_teammate_collision_width() {
+    return static_cast<rclcpp::Node*>(brain)->get_parameter_or("strategy.cooperation.teammate_collision_width", 0.85);
 }
 
 

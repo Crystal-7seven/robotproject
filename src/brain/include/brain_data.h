@@ -126,6 +126,7 @@ public:
     bool tmImLead = true; 
     bool tmImAlive = true; 
     double tmMyCost = 0.;
+    bool tmMyCostInitialized = false;
     int tmMyCostRank = 0; // Rank of my cost to reach the ball, used for multi-robot coordination. Cost roughly equals seconds to reach/kick the ball.
     int myStrikerIDRank = 0; // My ID rank among strikers, used for multi-robot coordination.
     bool tmImInVisualKick = false; // Whether I am currently in VisualKick mode, used to coordinate with teammates and avoid conflicts.

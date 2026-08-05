@@ -33,6 +33,18 @@ brain_node:
       cooperation:
         enable_role_switch: true
         ball_control_cost_threshold: 20.0
+        ball_control_cost_tie_epsilon: 0.35
+        touch_cost:
+          enabled: true
+          w_arrival_time: 1.0
+          w_ball_age: 0.5
+          w_heading: 0.3
+          w_adjust: 1.0
+          w_obstacle: 2.0
+          w_teammate: 3.0
+          ema_alpha: 0.35
+          switch_margin_secs: 0.75
+        teammate_collision_width: 0.85
 
     obstacle_avoidance:
       depth_sample_step: 16

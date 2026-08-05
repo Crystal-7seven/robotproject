@@ -207,7 +207,7 @@ public:
      * 
      * @return double, collision distance
      */
-    double distToObstacle(double angle);
+    double distToObstacle(double angle, bool includeTeammates = true);
 
     vector<double> findSafeDirections(double startAngle, double safeDist, double step=deg2rad(10));
 
@@ -301,4 +301,6 @@ private:
     std::shared_ptr<rclcpp::ParameterEventHandler> param_subscriber_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> team_id_handle_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> player_role_handle_;
+
+    int selectedLeaderId_ = -1;
 };
