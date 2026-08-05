@@ -31,7 +31,7 @@ struct FieldDimensions
                               // Note: naming is chosen to align with competition rules.
 };
 const FieldDimensions FD_KIDSIZE{9, 6, 1.5, 2.6, 0.75, 2, 5, 1, 3};
-const FieldDimensions FD_ADULTSIZE{14, 9, 2.1, 2.6, 1.5, 3, 6, 1, 4};
+const FieldDimensions FD_ADULTSIZE{14, 8, 2.1, 2.45, 1.22, 3, 5.6, 1, 3.7};
 const FieldDimensions FD_ROBOLEAGUE{22, 14, 3.6, 2.6, 2, 2.25, 6.9, 0.75, 3.9};
 
 // Pose2D: records a 2D point and orientation
