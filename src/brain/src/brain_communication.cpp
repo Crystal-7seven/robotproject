@@ -1,5 +1,6 @@
 #include "brain.h"
 #include "brain_communication.h"
+#include <cstddef>
 
 BrainCommunication::BrainCommunication(Brain *argBrain) : brain(argBrain)
 {
@@ -427,6 +428,15 @@ void BrainCommunication::unicastCommunication() {
         msg.thetaRb = brain->data->robotBallAngleToField;
         msg.cmdId = brain->data->tmMyCmdId;
         msg.cmd = brain->data->tmMyCmd;
+
+        msg.sendStampMs = static_cast<int64_t>(brain->get_clock()->now().nanoseconds() / 1000000LL);
+        if (brain->data->ballDetected || brain->tree->getEntry<bool>("ball_location_known")) {
+            msg.ballAge = static_cast<float>((brain->get_clock()->now() - brain->data->ball.timePoint).seconds());
+        }
+        else{
+            msg.ballAge = -1.f;
+        }
+
         log(format("ImAlive: %d, ImLead: %d, myCost: %.1f, myCmdId: %d, myCmd: %d", msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
 
         std::lock_guard<std::mutex> lock(_teammate_addresses_mutex);
@@ -515,17 +525,25 @@ void BrainCommunication::spinCommunicationReceiver() {
     while (_receive_communication_flag.load(std::memory_order_relaxed)) {
 
         ssize_t len = recvfrom(_communication_recv_socket, &msg, sizeof(msg), 0, (sockaddr *)&addr, &addr_len);
-
+        
         if (len < 0) {
-            cout << RED_CODE << format("receiving UDP message failed: %s", strerror(errno))
-                << RESET_CODE << endl;
+            cout << RED_CODE << format("receiving UDP message failed: %s",strerror(errno)) << RESET_CODE << endl;
             continue;
         }
 
-        if (len != sizeof(TeamCommunicationMsg)) {
-            cout << YELLOW_CODE << format("received TeamCommunicationMsg packet with wrong size: %ld, expected: %ld", len, sizeof(TeamCommunicationMsg))
-                << RESET_CODE << endl;
+        // 旧包不含 sendStampMs/ballAge
+        const ssize_t kLegacySize = static_cast<ssize_t>(
+        offsetof(TeamCommunicationMsg, sendStampMs)); 
+        const ssize_t kNewSize = static_cast<ssize_t>(sizeof(TeamCommunicationMsg));
+        if (len != kLegacySize && len != kNewSize) {
+            cout << YELLOW_CODE << format(
+            "received TeamCommunicationMsg wrong size: %ld (legacy=%ld new=%ld)",len, kLegacySize, kNewSize) << RESET_CODE << endl;
             continue;
+        }
+        // 旧包尾部没有 sendStampMs/ballAge 字段，手动设置默认值
+        if (len == kLegacySize) {
+            msg.sendStampMs = 0;
+            msg.ballAge = -1.f;
         }
 
         if (msg.validation != VALIDATION_COMMUNICATION) { // fail to pass validation
@@ -563,38 +581,56 @@ void BrainCommunication::spinCommunicationReceiver() {
             continue;
         }
 
-        log(format("TMID: %.d, alive: %d, lead: %d, cost: %.1f, CmdId: %d, Cmd: %d", msg.playerId, msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
-
         TMStatus &tmStatus = brain->data->tmStatus[tmIdx];
-        
+        // 1) 去重 / 拒乱序：只接受 communicationId 严格更大的包
+        if (tmStatus.lastCommunicationId >= 0 && msg.communicationId <= tmStatus.lastCommunicationId) {
+            // 重复或乱序，丢弃整包
+            continue;
+        }
+        // 2) 延迟包：sendStamp 有效时检查
+        bool delayed = false;
+        constexpr int64_t MAX_DELAY_MS = 500; // 建议值，可配置
+        if (msg.sendStampMs > 0) {
+            const int64_t nowMs =
+            brain->get_clock()->now().nanoseconds() / 1000000LL;
+            if (nowMs - msg.sendStampMs > MAX_DELAY_MS) {
+                delayed = true;
+            }
+        }
+
+        log(format("TMID: %.d, alive: %d, lead: %d, cost: %.1f, CmdId: %d, Cmd: %d", msg.playerId, msg.isAlive, msg.isLead, msg.cost, msg.cmdId, msg.cmd));
+        tmStatus.lastCommunicationId = msg.communicationId;
+        tmStatus.timeLastCom = brain->get_clock()->now();
+        tmStatus.ballAge = msg.ballAge;
         switch(msg.playerRole) {
             case 1: tmStatus.role = "striker"; break;
             case 2: tmStatus.role = "goal_keeper"; break;
             default: tmStatus.role = "unknown"; break;
         }
         tmStatus.isAlive = msg.isAlive;
-        tmStatus.ballDetected = msg.ballDetected;
-        tmStatus.ballLocationKnown = msg.ballLocationKnown;
-        tmStatus.ballConfidence = msg.ballConfidence;
-        tmStatus.ballRange = msg.ballRange;
-        tmStatus.cost = msg.cost;
-        tmStatus.isLead = msg.isLead;
-        tmStatus.ballPosToField = msg.ballPosToField;
-        tmStatus.robotPoseToField = msg.robotPoseToField;
-        tmStatus.kickDir = msg.kickDir;
-        tmStatus.thetaRb = msg.thetaRb;
-        tmStatus.timeLastCom = brain->get_clock()->now();
         tmStatus.cmd = msg.cmd;
         tmStatus.cmdId = msg.cmdId;
-
-        // Check if a new command has been received
-        if (msg.cmdId > brain->data->tmCmdId) {
+        if (!delayed) {
+            tmStatus.ballDetected = msg.ballDetected;
+            tmStatus.ballLocationKnown = msg.ballLocationKnown;
+            tmStatus.ballConfidence = msg.ballConfidence;
+            tmStatus.ballRange = msg.ballRange;
+            tmStatus.cost = msg.cost;
+            tmStatus.isLead = msg.isLead;
+            tmStatus.ballPosToField = msg.ballPosToField;
+            tmStatus.robotPoseToField = msg.robotPoseToField;
+            tmStatus.kickDir = msg.kickDir;
+            tmStatus.thetaRb = msg.thetaRb;
+            tmStatus.poseValid = true;
+        } else {
+            tmStatus.poseValid = false;
+        }
+        if (!delayed && msg.cmdId > brain->data->tmCmdId) {
             brain->data->tmCmdId = msg.cmdId;
             brain->data->tmReceivedCmd = msg.cmd;
             brain->data->tmLastCmdChangeTime = brain->get_clock()->now();
             log(format("Received new command from teammate %d: %d", msg.playerId, msg.cmd));
         }
-
     }
 }
 

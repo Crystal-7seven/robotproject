@@ -24,6 +24,10 @@ struct TeamCommunicationMsg
     double thetaRb;
     int cmdId; // Each player increments cmdId when publishing; used to indicate message order.
     int cmd; // Encoded command: hundreds digit=1 means self requests ball control; tens digit=1 means goalkeeper requests substitution, units digit stores substitute playerId. e.g. 100 = self requests ball control; 011 = goalkeeper goes out and requests player 1 to substitute.
+
+    int64_t sendStampMs = 0; // 发送时刻（steady/ROS 时钟毫秒），用于延迟判断
+    float ballAge = -1.f;    // 球观测年龄（秒）；-1 表示无有效球时间
+
 };
 
 struct TeamDiscoveryMsg

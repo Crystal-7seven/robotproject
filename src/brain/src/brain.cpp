@@ -176,8 +176,13 @@ void Brain::init()
     auto now = get_clock()->now();
     for (int i = 0; i < MAX_NUM_PLAYERS; i++) {
         data->tmStatus[i].isAlive = false;
+        data->tmStatus[i].isLead = false;
         data->tmStatus[i].timeLastCom = now;
+        data->tmStatus[i].lastCommunicationId = -1;
+        data->tmStatus[i].poseValid = false;
+        data->tmStatus[i].ballAge = -1.f;
     }
+
     data->tmLastCmdChangeTime = now;
 
 
@@ -239,10 +244,16 @@ void Brain::init()
             this->communication->initCommunication();
             // Reset teammates communication status
             auto now = get_clock()->now();
+
             for (int i = 0; i < MAX_NUM_PLAYERS; i++) {
                 this->data->tmStatus[i].isAlive = false;
+                this->data->tmStatus[i].isLead = false;
                 this->data->tmStatus[i].timeLastCom = now;
+                this->data->tmStatus[i].lastCommunicationId = -1;
+                this->data->tmStatus[i].poseValid = false;
+                this->data->tmStatus[i].ballAge = -1.f;
             }
+
             RCLCPP_INFO(this->get_logger(), "[team_id_subscripter] communication re-init success");
         };
 
@@ -411,13 +422,26 @@ void Brain::handleCooperation() {
     for (int i = 0; i < playerCount; i++) {
         if (i == selfIdx) continue; // Skip self
 
-        if (
-            data->penalty[i] != PENALTY_NONE // Penalized by referee
-            || msecsSince(data->tmStatus[i].timeLastCom) > COM_TIMEOUT // Or communication timeout
-        ) {
-            data->tmStatus[i].isAlive = false;
-            data->tmStatus[i].isLead = false;
+        if (data->penalty[i] != PENALTY_NONE || msecsSince(data->tmStatus[i].timeLastCom) > COM_TIMEOUT){
+            auto &s = data->tmStatus[i];
+            s.isAlive = false;
+            s.isLead = false;
+            s.ballDetected = false;
+            s.ballLocationKnown = false;
+            s.ballConfidence = 0.;
+            s.ballRange = 0.;
+            s.cost = 1e9;          // 极大代价，避免参与 lead 比较
+            s.ballPosToField = {};
+            s.robotPoseToField = {};
+            s.kickDir = 0.;
+            s.thetaRb = 0.;
+            s.cmd = 0;
+            // cmdId / lastCommunicationId 可保留，避免超时后旧小数 cmdId 被当成“新指令”
+            s.ballAge = -1.f;
+            s.poseValid = false;
+            // role 可保留或设 "unknown"；建议保留最后角色，仅作调试
         }
+
         
         if (data->tmStatus[i].isAlive) {
             aliveTmIdxs.push_back(i);
@@ -441,7 +465,8 @@ void Brain::handleCooperation() {
     for (int i = 0; i < aliveTmIdxs.size(); i++) {
         auto status = data->tmStatus[aliveTmIdxs[i]];
         log_(format("TM %d, ballDetected: %d, ballRange: %.1f", i + 1, status.ballDetected, status.ballRange));
-        if (status.ballDetected && status.ballRange < minRange) {
+        if (status.poseValid && status.ballAge >= 0.f && status.ballAge < 1.0f
+            && status.ballDetected&& status.ballRange < minRange) {
             log_(format("tm ball range(%.1f) < minRange(%.1f)", status.ballRange, minRange));
             double dist = norm(status.ballPosToField.x - data->robotPoseToField.x, status.ballPosToField.y - data->robotPoseToField.y);
             if (dist > RANGE_THRESHOLD) {

@@ -193,7 +193,7 @@ struct TMStatus {
     double ballConfidence = 0.;
     double ballRange = 0.;
     double cost = 0.;
-    bool isLead = true;
+    bool isLead = false;          //从true改成false
     Point ballPosToField;
     Pose2D robotPoseToField;
     double kickDir = 0.;
@@ -201,6 +201,11 @@ struct TMStatus {
     int cmd = 0;
     int cmdId = 0;
     rclcpp::Time timeLastCom;
+
+    int lastCommunicationId = -1; // 上次接受的 communicationId；-1=尚未收到
+    float ballAge = -1.f;         // 来自对端的球年龄（秒）
+    bool poseValid = false;       // 位姿/球位是否仍可用于决策
+
 };
 
 
